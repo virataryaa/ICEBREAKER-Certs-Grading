@@ -12,12 +12,6 @@ OUT.mkdir(parents=True, exist_ok=True)
 TODAY = datetime.date.today().isoformat()
 START = "2015-01-01"
 
-# ---------------------------------------------------------------------------
-# Symbol map: output column -> ICE symbol
-# Column names match existing cert_lrc.parquet so app.py reads without change
-# ICE adds LEH (Leherhafen) and MAR (Marseille) vs LSEG
-# ---------------------------------------------------------------------------
-
 PORT_MAP = {
     "LRC-AMS-VG": "RC.AMS #STO-IFND",
     "LRC-ANT-VG": "RC.ANT #STO-IFND",
@@ -31,7 +25,6 @@ PORT_MAP = {
     "LRC-NOR-VG": "RC.NOR #STO-IFND",
     "LRC-ROT-VG": "RC.ROT #STO-IFND",
     "LRC-TRI-VG": "RC.TRI #STO-IFND",
-    # New vs LSEG
     "LRC-LEH-VG": "RC.LEH #STO-IFND",
     "LRC-MAR-VG": "RC.MAR #STO-IFND",
 }
@@ -40,10 +33,6 @@ TOTAL_COL = "LRC-TOT-VG"
 TOTAL_SYM = "RC.TOTAL #STO-IFND"
 FIELD     = "Lots With Val Cert Close"
 
-
-# ---------------------------------------------------------------------------
-# Fetch helpers
-# ---------------------------------------------------------------------------
 
 def fetch_timeseries(symbols):
     if not symbols:
@@ -79,24 +68,39 @@ def fetch_price():
         return pd.Series(dtype=float, name="RC_Price")
 
 
-# ---------------------------------------------------------------------------
-# Build
-# ---------------------------------------------------------------------------
-
 def build_rc():
-    # --- 1. Fetch all port symbols + total ----------------------------------
+    global START
+    out_file = OUT / "cert_lrc.parquet"
+
+    # ── Upsert: read existing parquet, fetch only new rows ──────────────────
+    existing = None
+    if out_file.exists():
+        try:
+            existing = pd.read_parquet(out_file)
+            if not existing.empty and "Date" in existing.columns:
+                last_date = pd.to_datetime(existing["Date"]).max()
+                fetch_from = (last_date + pd.Timedelta(days=1)).date().isoformat()
+                print(f"[RC] Existing: {len(existing)} rows, last={last_date.date()}")
+                print(f"[RC] Incremental fetch from {fetch_from}")
+                START = fetch_from
+        except Exception as exc:
+            print(f"[RC] warn reading existing parquet: {exc}")
+
+    # ── Fetch port symbols + total ───────────────────────────────────────────
     all_syms = list(PORT_MAP.values()) + [TOTAL_SYM]
     print(f"[RC] Fetching {len(all_syms)} port symbols ...")
 
     parts = []
     for i in range(0, len(all_syms), 50):
         batch = all_syms[i : i + 50]
-        print(f"  batch {i // 50 + 1}: {batch[0]} ... {batch[-1]}")
         batch_df = fetch_timeseries(batch)
         if not batch_df.empty:
             parts.append(batch_df)
 
     if not parts:
+        if existing is not None:
+            print("[RC] No new data — already up to date.")
+            return existing
         print("[RC] No data returned.")
         return
 
@@ -105,12 +109,11 @@ def build_rc():
         df = df.merge(p, on="Date", how="outer")
     df = df.sort_values("Date").reset_index(drop=True)
 
-    # Rename ICE symbols -> output column names
     reverse_map = {v: k for k, v in PORT_MAP.items()}
     reverse_map[TOTAL_SYM] = TOTAL_COL
     df = df.rename(columns=reverse_map)
 
-    # --- 2. RC price --------------------------------------------------------
+    # ── RC price ─────────────────────────────────────────────────────────────
     print("[RC] Fetching RC price ...")
     rc_price = fetch_price()
     if not rc_price.empty:
@@ -118,16 +121,23 @@ def build_rc():
         df = df.merge(price_df, on="Date", how="left")
         df["RC_Price"] = df["RC_Price"].ffill()
 
-    # --- 3. Drop rows where total is missing --------------------------------
     if TOTAL_COL in df.columns:
         df = df.dropna(subset=[TOTAL_COL])
 
-    # --- 4. Save ------------------------------------------------------------
+    # ── Upsert merge ─────────────────────────────────────────────────────────
+    if existing is not None and not df.empty:
+        n_new = len(df)
+        df = pd.concat([existing, df], ignore_index=True)
+        df = df.drop_duplicates(subset=["Date"]).sort_values("Date").reset_index(drop=True)
+        print(f"[RC] Upserted: {len(df)} rows total ({n_new} new)")
+    elif existing is not None:
+        print("[RC] No new rows — already up to date.")
+        return existing
+
     out_file = OUT / "cert_lrc.parquet"
     df.to_parquet(out_file, index=False)
     print(f"[RC] Saved: {out_file}")
-    print(f"     Rows: {len(df)} | Cols: {len(df.columns)}")
-    print(f"     Date range: {df['Date'].min().date()} to {df['Date'].max().date()}")
+    print(f"     Rows: {len(df)} | Date range: {df['Date'].min().date()} to {df['Date'].max().date()}")
     return df
 
 

@@ -11,33 +11,23 @@ OUT.mkdir(parents=True, exist_ok=True)
 
 TODAY = datetime.date.today().isoformat()
 START = "2020-01-01"
+LOOKBACK_DAYS = 90  # re-fetch last N days to catch panel updates
 
 FIELDS = [
-    "Panel Date",
-    "Panel Time",
-    "Panel Type",
-    "Port ID",
-    "Origin",
-    "Group No Close",
-    "Allowance Close",
-    "Tenderable",
-    "Regrade",
-    "Previous Tenderable",
-    "SDU Close",
-    "LDU Close",
-    "BDU Close",
-    "Lots Close",
+    "Panel Date", "Panel Time", "Panel Type", "Port ID", "Origin",
+    "Group No Close", "Allowance Close", "Tenderable", "Regrade",
+    "Previous Tenderable", "SDU Close", "LDU Close", "BDU Close", "Lots Close",
 ]
+
+DEDUP_KEYS = ["PublishedDate", "PortId", "Origin", "GroupNumber"]
 
 
 def get_lcc_grd_symbols():
-    """Return all C.N #GRD-IFND symbols (London Cocoa only, exclude RC)."""
     try:
         result = ice.get_search("C #GRD-IFND", rows=500)
         syms = []
         for row in (result or []):
             sym = str(row[0] if isinstance(row, (list, tuple)) else row).strip()
-            # Must start with "C." but NOT "CC." or "RC."
             if sym.startswith("C.") and "#GRD-IFND" in sym:
                 syms.append(sym)
         return syms
@@ -47,7 +37,6 @@ def get_lcc_grd_symbols():
 
 
 def fetch_grading_panel(sym):
-    """Pull full timeseries for one GRD symbol, return one row per unique panel."""
     try:
         result = ice.get_timeseries(
             sym, FIELDS, granularity="D", start_date=START, end_date=TODAY
@@ -58,34 +47,46 @@ def fetch_grading_panel(sym):
         df = pd.DataFrame(list(result[1:]), columns=result[0])
         df = df.rename(columns={"Time": "Date"})
         df.columns = ["Date"] + [c.replace(f"{sym}.", "") for c in df.columns[1:]]
-
         df = df.dropna(subset=["Lots Close"])
         if df.empty:
             return pd.DataFrame()
 
         df["Panel Date"] = pd.to_datetime(df["Panel Date"], errors="coerce")
-        df = df.sort_values("Date")
-
-        # One row per unique panel — keep most recent observation
         panel_rows = (
             df.sort_values("Date")
             .groupby(["Panel Date", "Port ID", "Origin", "Group No Close"], dropna=False)
             .last()
             .reset_index()
         )
-
         return panel_rows[[
             "Panel Date", "Panel Time", "Panel Type", "Port ID", "Origin",
             "Group No Close", "Allowance Close", "Tenderable", "Regrade",
             "Previous Tenderable", "SDU Close", "LDU Close", "BDU Close", "Lots Close",
         ]]
-
     except Exception as exc:
         print(f"  warn {sym}: {exc}")
         return pd.DataFrame()
 
 
 def build_lcc_grading():
+    global START
+    out_file = OUT / "grading_lcc.parquet"
+
+    # ── Upsert: read existing, fetch only recent window to catch updates ─────
+    existing = None
+    if out_file.exists():
+        try:
+            existing = pd.read_parquet(out_file)
+            if not existing.empty and "PublishedDate" in existing.columns:
+                last_date = pd.to_datetime(existing["PublishedDate"]).max()
+                lookback_start = (last_date - pd.Timedelta(days=LOOKBACK_DAYS)).date().isoformat()
+                fetch_from = max(lookback_start, START)
+                print(f"[LCC GRD] Existing: {len(existing)} rows, last={last_date.date()}")
+                print(f"[LCC GRD] Fetching from {fetch_from} (last {LOOKBACK_DAYS}d + any new panels)")
+                START = fetch_from
+        except Exception as exc:
+            print(f"[LCC GRD] warn reading existing: {exc}")
+
     print("[LCC GRD] Discovering symbols ...")
     syms = get_lcc_grd_symbols()
     print(f"[LCC GRD] Found {len(syms)} symbols")
@@ -101,45 +102,45 @@ def build_lcc_grading():
             print(f"    no data")
 
     if not all_panels:
+        if existing is not None:
+            print("[LCC GRD] No new data — returning existing.")
+            return existing
         print("[LCC GRD] No grading data returned.")
         return
 
     df = pd.concat(all_panels, ignore_index=True)
-
-    # Deduplicate: same panel in multiple symbols — keep latest lot count
     df = (
         df.sort_values("Panel Date")
-        .drop_duplicates(
-            subset=["Panel Date", "Port ID", "Origin", "Group No Close"], keep="last"
-        )
+        .drop_duplicates(subset=["Panel Date", "Port ID", "Origin", "Group No Close"], keep="last")
         .reset_index(drop=True)
     )
 
-    # Rename columns to match grading screenshot format
     df = df.rename(columns={
-        "Panel Date":       "PublishedDate",
-        "Panel Time":       "PanelTime",
-        "Panel Type":       "PanelType",
-        "Port ID":          "PortId",
-        "Group No Close":   "GroupNumber",
-        "Allowance Close":  "TotalAllowance",
+        "Panel Date": "PublishedDate", "Panel Time": "PanelTime",
+        "Panel Type": "PanelType", "Port ID": "PortId",
+        "Group No Close": "GroupNumber", "Allowance Close": "TotalAllowance",
         "Previous Tenderable": "PreviousTenderable",
-        "SDU Close":        "SDU",
-        "LDU Close":        "LDU",
-        "BDU Close":        "BDU",
-        "Lots Close":       "Lots",
+        "SDU Close": "SDU", "LDU Close": "LDU", "BDU Close": "BDU", "Lots Close": "Lots",
     })
-
     df.insert(0, "Commodity", "LCC")
-
     df["PublishedDate"] = pd.to_datetime(df["PublishedDate"])
     for col in ["GroupNumber", "TotalAllowance", "Tenderable", "Regrade",
                 "PreviousTenderable", "SDU", "LDU", "BDU", "Lots"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
-
     df = df.sort_values("PublishedDate").reset_index(drop=True)
 
-    out_file = OUT / "grading_lcc.parquet"
+    # ── Upsert merge ─────────────────────────────────────────────────────────
+    if existing is not None and not df.empty:
+        combined = pd.concat([existing, df], ignore_index=True)
+        combined = (
+            combined.sort_values("PublishedDate")
+            .drop_duplicates(subset=DEDUP_KEYS, keep="last")
+            .reset_index(drop=True)
+        )
+        n_new = len(combined) - len(existing)
+        print(f"[LCC GRD] Upserted: {len(combined)} rows total ({n_new} new/updated)")
+        df = combined
+
     df.to_parquet(out_file, index=False)
     print(f"\n[LCC GRD] Saved: {out_file}")
     print(f"          Rows: {len(df)} | Date range: {df['PublishedDate'].min().date()} to {df['PublishedDate'].max().date()}")
@@ -147,10 +148,4 @@ def build_lcc_grading():
 
 
 if __name__ == "__main__":
-    df = build_lcc_grading()
-
-    if df is not None:
-        print("\n--- Latest Grading Panels ---")
-        latest = df.sort_values("PublishedDate", ascending=False)
-        print(latest[["PublishedDate", "PortId", "Origin", "GroupNumber",
-                       "Tenderable", "SDU", "LDU", "BDU"]].head(20).to_string(index=False))
+    build_lcc_grading()

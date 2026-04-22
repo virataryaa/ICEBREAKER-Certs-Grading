@@ -13,24 +13,13 @@ TODAY = datetime.date.today().isoformat()
 START = "2015-01-01"
 
 PORT_MAP = {
-    "AMS": "C.AMS #STO-IFND",
-    "ANT": "C.ANT #STO-IFND",
-    "BAR": "C.BAR #STO-IFND",
-    "BRE": "C.BRE #STO-IFND",
-    "GEN": "C.GEN #STO-IFND",
-    "HAM": "C.HAM #STO-IFND",
-    "LEH": "C.LEH #STO-IFND",
-    "LIV": "C.LIV #STO-IFND",
-    "LON": "C.LON #STO-IFND",
-    "MAR": "C.MAR #STO-IFND",
-    "NOR": "C.NOR #STO-IFND",
-    "ROT": "C.ROT #STO-IFND",
-    "TRI": "C.TRI #STO-IFND",
-    "TOT": "C.TOTAL #STO-IFND",
+    "AMS": "C.AMS #STO-IFND", "ANT": "C.ANT #STO-IFND", "BAR": "C.BAR #STO-IFND",
+    "BRE": "C.BRE #STO-IFND", "GEN": "C.GEN #STO-IFND", "HAM": "C.HAM #STO-IFND",
+    "LEH": "C.LEH #STO-IFND", "LIV": "C.LIV #STO-IFND", "LON": "C.LON #STO-IFND",
+    "MAR": "C.MAR #STO-IFND", "NOR": "C.NOR #STO-IFND", "ROT": "C.ROT #STO-IFND",
+    "TRI": "C.TRI #STO-IFND", "TOT": "C.TOTAL #STO-IFND",
 }
 
-# ICE field -> output column suffix
-# Column format: LCC-{PORT}-{SUFFIX}
 FIELD_SUFFIX = {
     "Total Valid Close":                    "TOTAL",
     "SDU With Perpetual Valid Cert Close":  "SDU_PERP",
@@ -87,6 +76,23 @@ def fetch_price():
 
 
 def build_lcc():
+    global START
+    out_file = OUT / "cert_lcc.parquet"
+
+    # ── Upsert: read existing, fetch only new rows ───────────────────────────
+    existing = None
+    if out_file.exists():
+        try:
+            existing = pd.read_parquet(out_file)
+            if not existing.empty and "Date" in existing.columns:
+                last_date = pd.to_datetime(existing["Date"]).max()
+                fetch_from = (last_date + pd.Timedelta(days=1)).date().isoformat()
+                print(f"[LCC] Existing: {len(existing)} rows, last={last_date.date()}")
+                print(f"[LCC] Incremental fetch from {fetch_from}")
+                START = fetch_from
+        except Exception as exc:
+            print(f"[LCC] warn reading existing parquet: {exc}")
+
     all_syms = list(PORT_MAP.values())
     print(f"[LCC] Fetching {len(all_syms)} port symbols ...")
 
@@ -99,6 +105,9 @@ def build_lcc():
             parts.append(batch_df)
 
     if not parts:
+        if existing is not None:
+            print("[LCC] No new data — already up to date.")
+            return existing
         print("[LCC] No data returned.")
         return
 
@@ -107,21 +116,16 @@ def build_lcc():
         df = df.merge(p, on="Date", how="outer")
     df = df.sort_values("Date").reset_index(drop=True)
 
-    # Rename: "C.AMS #STO-IFND.Total Valid Close" -> "LCC-AMS-TOTAL"
     rename_map = {}
     for port, sym in PORT_MAP.items():
         for field, suffix in FIELD_SUFFIX.items():
-            old = f"{sym}.{field}"
-            new = f"LCC-{port}-{suffix}"
-            rename_map[old] = new
+            rename_map[f"{sym}.{field}"] = f"LCC-{port}-{suffix}"
     df = df.rename(columns=rename_map)
 
-    # Drop rows where grand total missing
     tot_col = "LCC-TOT-TOTAL"
     if tot_col in df.columns:
         df = df.dropna(subset=[tot_col])
 
-    # LCC price
     print("[LCC] Fetching LCC price ...")
     lcc_price = fetch_price()
     if not lcc_price.empty:
@@ -129,7 +133,16 @@ def build_lcc():
         df = df.merge(price_df, on="Date", how="left")
         df["LCC_Price"] = df["LCC_Price"].ffill()
 
-    out_file = OUT / "cert_lcc.parquet"
+    # ── Upsert merge ─────────────────────────────────────────────────────────
+    if existing is not None and not df.empty:
+        n_new = len(df)
+        df = pd.concat([existing, df], ignore_index=True)
+        df = df.drop_duplicates(subset=["Date"]).sort_values("Date").reset_index(drop=True)
+        print(f"[LCC] Upserted: {len(df)} rows total ({n_new} new)")
+    elif existing is not None:
+        print("[LCC] No new rows — already up to date.")
+        return existing
+
     df.to_parquet(out_file, index=False)
     print(f"\n[LCC] Saved: {out_file}")
     print(f"      Rows: {len(df)} | Cols: {len(df.columns)}")
@@ -139,17 +152,4 @@ def build_lcc():
 
 
 if __name__ == "__main__":
-    df = build_lcc()
-
-    if df is not None and not df.empty:
-        print("\n--- Latest LCC Stocks ---")
-        latest = df.iloc[-1]
-        print(f"Date: {latest['Date'].date()}")
-        total_cols = [c for c in df.columns if c.endswith("-TOTAL")]
-        for col in sorted(total_cols):
-            val = latest.get(col)
-            try:
-                if pd.notna(val) and float(val) > 0:
-                    print(f"  {col}: {int(float(val)):,}")
-            except (TypeError, ValueError):
-                pass
+    build_lcc()

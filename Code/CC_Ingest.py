@@ -16,7 +16,6 @@ FIELD = "Bags Close"
 
 
 def get_cc_symbols():
-    """Return all CC.xxx #CER-IFND individual-origin symbols from ICE search."""
     try:
         result = ice.get_search("CC #CER-IFND", rows=500)
         if not result:
@@ -33,11 +32,6 @@ def get_cc_symbols():
 
 
 def parse_cc_sym(sym):
-    """
-    Parse CC.{ORIGIN3}{GROUP1}{PORT2} #CER-IFND -> (origin, group, port).
-    TOTAL symbols: CC.TOTAL{PORT} -> (TOTAL, None, port).
-    Returns None if format unrecognised.
-    """
     inner = sym.replace("CC.", "").replace(" #CER-IFND", "").strip()
     if inner == "TOTAL":
         return ("TOTAL", None, "TOT")
@@ -83,31 +77,44 @@ def fetch_price():
 
 
 def build_cc():
+    global START
+    out_file = OUT / "cert_cc.parquet"
+
+    # ── Upsert: read existing, fetch only new rows ───────────────────────────
+    existing = None
+    if out_file.exists():
+        try:
+            existing = pd.read_parquet(out_file)
+            if not existing.empty and "Date" in existing.columns:
+                last_date = pd.to_datetime(existing["Date"]).max()
+                fetch_from = (last_date + pd.Timedelta(days=1)).date().isoformat()
+                print(f"[CC] Existing: {len(existing)} rows, last={last_date.date()}")
+                print(f"[CC] Incremental fetch from {fetch_from}")
+                START = fetch_from
+        except Exception as exc:
+            print(f"[CC] warn reading existing parquet: {exc}")
+
+    # ── Discover + fetch symbols ─────────────────────────────────────────────
     print("[CC] Discovering symbols ...")
     all_syms = get_cc_symbols()
     print(f"[CC] Found {len(all_syms)} symbols")
 
     if not all_syms:
+        if existing is not None:
+            print("[CC] No symbols found — returning existing.")
+            return existing
         print("[CC] No symbols found. Aborting.")
         return
 
-    # Build symbol -> column name
     sym_to_col = {}
     for sym in all_syms:
         parsed = parse_cc_sym(sym)
         if parsed is None:
-            print(f"  skip (unrecognised format): {sym}")
             continue
         origin, group, port = parsed
-        if group is None:
-            col = f"CC-TOT-{port}"
-        else:
-            col = f"CC-{origin}-{group}-{port}"
-        sym_to_col[sym] = col
+        sym_to_col[sym] = f"CC-TOT-{port}" if group is None else f"CC-{origin}-{group}-{port}"
 
-    # Exclude grand total — fetched separately below to avoid duplicate column
     sym_to_col.pop("CC.TOTAL #CER-IFND", None)
-
     valid_syms = list(sym_to_col.keys())
     print(f"[CC] Fetching {len(valid_syms)} symbols ...")
 
@@ -121,6 +128,9 @@ def build_cc():
             parts.append(batch_df)
 
     if not parts:
+        if existing is not None:
+            print("[CC] No new data — already up to date.")
+            return existing
         print("[CC] No data returned.")
         return
 
@@ -130,31 +140,28 @@ def build_cc():
     df = df.sort_values("Date").reset_index(drop=True)
     df = df.rename(columns=sym_to_col)
 
-    # --- Origin totals (sum across ports per origin+group) ---
-    # Collect unique (origin, group) pairs from the columns
+    # ── Origin totals ────────────────────────────────────────────────────────
     origin_groups = set()
     for col in df.columns:
-        parts_col = col.split("-")
-        if len(parts_col) == 4 and parts_col[0] == "CC" and parts_col[1] != "TOT":
-            origin_groups.add((parts_col[1], parts_col[2]))
-
+        p = col.split("-")
+        if len(p) == 4 and p[0] == "CC" and p[1] != "TOT":
+            origin_groups.add((p[1], p[2]))
     for (origin, group) in origin_groups:
         port_cols = [c for c in df.columns if c.startswith(f"CC-{origin}-{group}-") and not c.endswith("-TOT")]
         if port_cols:
             df[f"CC-{origin}-{group}-TOT"] = df[port_cols].sum(axis=1, min_count=1)
 
-    # --- Grand total ---
+    # ── Grand total ──────────────────────────────────────────────────────────
     grand = fetch_timeseries(["CC.TOTAL #CER-IFND"])
     if not grand.empty:
         grand = grand.rename(columns={"CC.TOTAL #CER-IFND": "CC-TOT-TOT"})
         df = df.merge(grand, on="Date", how="left")
     else:
-        # Fall back: sum all origin-group-TOT cols
         tot_cols = [c for c in df.columns if c.endswith("-TOT") and c != "CC-TOT-TOT"]
         if tot_cols:
             df["CC-TOT-TOT"] = df[tot_cols].sum(axis=1, min_count=1)
 
-    # --- CC price ---
+    # ── CC price ─────────────────────────────────────────────────────────────
     print("[CC] Fetching CC price ...")
     cc_price = fetch_price()
     if not cc_price.empty:
@@ -162,11 +169,19 @@ def build_cc():
         df = df.merge(price_df, on="Date", how="left")
         df["CC_Price"] = df["CC_Price"].ffill()
 
-    # Drop rows where grand total missing
     if "CC-TOT-TOT" in df.columns:
         df = df.dropna(subset=["CC-TOT-TOT"])
 
-    out_file = OUT / "cert_cc.parquet"
+    # ── Upsert merge ─────────────────────────────────────────────────────────
+    if existing is not None and not df.empty:
+        n_new = len(df)
+        df = pd.concat([existing, df], ignore_index=True)
+        df = df.drop_duplicates(subset=["Date"]).sort_values("Date").reset_index(drop=True)
+        print(f"[CC] Upserted: {len(df)} rows total ({n_new} new)")
+    elif existing is not None:
+        print("[CC] No new rows — already up to date.")
+        return existing
+
     df.to_parquet(out_file, index=False)
     print(f"\n[CC] Saved: {out_file}")
     print(f"     Rows: {len(df)} | Cols: {len(df.columns)}")
@@ -176,14 +191,4 @@ def build_cc():
 
 
 if __name__ == "__main__":
-    df = build_cc()
-
-    if df is not None and not df.empty:
-        print("\n--- Latest CC Certified Stocks ---")
-        latest = df.iloc[-1]
-        print(f"Date: {latest['Date'].date()}")
-        tot_cols = sorted([c for c in df.columns if c.startswith("CC-TOT-")])
-        for col in tot_cols:
-            val = latest.get(col, float("nan"))
-            if pd.notna(val):
-                print(f"  {col}: {int(val):,}")
+    build_cc()
