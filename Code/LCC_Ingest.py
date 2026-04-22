@@ -1,0 +1,155 @@
+import datetime
+from pathlib import Path
+
+import icepython as ice
+import pandas as pd
+
+OUT = Path(
+    r"C:\Users\virat.arya\ETG\SoftsDatabase - Documents\Database\Hardmine\ICEBREAKER\Certs&Grading\Database"
+)
+OUT.mkdir(parents=True, exist_ok=True)
+
+TODAY = datetime.date.today().isoformat()
+START = "2015-01-01"
+
+PORT_MAP = {
+    "AMS": "C.AMS #STO-IFND",
+    "ANT": "C.ANT #STO-IFND",
+    "BAR": "C.BAR #STO-IFND",
+    "BRE": "C.BRE #STO-IFND",
+    "GEN": "C.GEN #STO-IFND",
+    "HAM": "C.HAM #STO-IFND",
+    "LEH": "C.LEH #STO-IFND",
+    "LIV": "C.LIV #STO-IFND",
+    "LON": "C.LON #STO-IFND",
+    "MAR": "C.MAR #STO-IFND",
+    "NOR": "C.NOR #STO-IFND",
+    "ROT": "C.ROT #STO-IFND",
+    "TRI": "C.TRI #STO-IFND",
+    "TOT": "C.TOTAL #STO-IFND",
+}
+
+# ICE field -> output column suffix
+# Column format: LCC-{PORT}-{SUFFIX}
+FIELD_SUFFIX = {
+    "Total Valid Close":                    "TOTAL",
+    "SDU With Perpetual Valid Cert Close":  "SDU_PERP",
+    "SDU With Initial Valid Cert Close":    "SDU_INIT",
+    "SDU With Exp Cert Close":              "SDU_EXP",
+    "SDU Non Tendered Close":               "SDU_NONTEND",
+    "SDU Suspended Close":                  "SDU_SUSP",
+    "LDU With Perpetual Valid Cert Close":  "LDU_PERP",
+    "LDU With Initial Valid Cert Close":    "LDU_INIT",
+    "LDU With Exp Cert Close":              "LDU_EXP",
+    "LDU Non Tendered Close":               "LDU_NONTEND",
+    "LDU Suspended Close":                  "LDU_SUSP",
+    "BDU With Perpetual Valid Cert Close":  "BDU_PERP",
+    "BDU With Initial Valid Cert Close":    "BDU_INIT",
+    "BDU With Exp Cert Close":              "BDU_EXP",
+    "BDU Non Tendered Close":               "BDU_NONTEND",
+    "BDU Suspended Close":                  "BDU_SUSP",
+}
+
+ALL_FIELDS = list(FIELD_SUFFIX.keys())
+
+
+def fetch_timeseries(symbols):
+    if not symbols:
+        return pd.DataFrame()
+    try:
+        result = ice.get_timeseries(
+            symbols, ALL_FIELDS, granularity="D", start_date=START, end_date=TODAY
+        )
+        if not result or len(result) < 2:
+            return pd.DataFrame()
+        df = pd.DataFrame(list(result[1:]), columns=result[0])
+        df["Time"] = pd.to_datetime(df["Time"])
+        df = df.rename(columns={"Time": "Date"})
+        return df
+    except Exception as exc:
+        print(f"  warn: {exc}")
+        return pd.DataFrame()
+
+
+def fetch_price():
+    try:
+        result = ice.get_timeseries(
+            "%LCC 1!-ICE", ["Settle"], granularity="D", start_date=START, end_date=TODAY
+        )
+        if not result or len(result) < 2:
+            return pd.Series(dtype=float, name="LCC_Price")
+        df = pd.DataFrame(list(result[1:]), columns=result[0])
+        df["Time"] = pd.to_datetime(df["Time"])
+        return df.set_index("Time").iloc[:, 0].rename("LCC_Price")
+    except Exception as exc:
+        print(f"  warn LCC price: {exc}")
+        return pd.Series(dtype=float, name="LCC_Price")
+
+
+def build_lcc():
+    all_syms = list(PORT_MAP.values())
+    print(f"[LCC] Fetching {len(all_syms)} port symbols ...")
+
+    parts = []
+    for i in range(0, len(all_syms), 10):
+        batch = all_syms[i : i + 10]
+        print(f"  batch {i // 10 + 1}: {batch[0]} ... {batch[-1]}")
+        batch_df = fetch_timeseries(batch)
+        if not batch_df.empty:
+            parts.append(batch_df)
+
+    if not parts:
+        print("[LCC] No data returned.")
+        return
+
+    df = parts[0]
+    for p in parts[1:]:
+        df = df.merge(p, on="Date", how="outer")
+    df = df.sort_values("Date").reset_index(drop=True)
+
+    # Rename: "C.AMS #STO-IFND.Total Valid Close" -> "LCC-AMS-TOTAL"
+    rename_map = {}
+    for port, sym in PORT_MAP.items():
+        for field, suffix in FIELD_SUFFIX.items():
+            old = f"{sym}.{field}"
+            new = f"LCC-{port}-{suffix}"
+            rename_map[old] = new
+    df = df.rename(columns=rename_map)
+
+    # Drop rows where grand total missing
+    tot_col = "LCC-TOT-TOTAL"
+    if tot_col in df.columns:
+        df = df.dropna(subset=[tot_col])
+
+    # LCC price
+    print("[LCC] Fetching LCC price ...")
+    lcc_price = fetch_price()
+    if not lcc_price.empty:
+        price_df = lcc_price.reset_index().rename(columns={"Time": "Date"})
+        df = df.merge(price_df, on="Date", how="left")
+        df["LCC_Price"] = df["LCC_Price"].ffill()
+
+    out_file = OUT / "cert_lcc.parquet"
+    df.to_parquet(out_file, index=False)
+    print(f"\n[LCC] Saved: {out_file}")
+    print(f"      Rows: {len(df)} | Cols: {len(df.columns)}")
+    if not df.empty:
+        print(f"      Date range: {df['Date'].min().date()} to {df['Date'].max().date()}")
+    return df
+
+
+if __name__ == "__main__":
+    df = build_lcc()
+
+    if df is not None and not df.empty:
+        print("\n--- Latest LCC Stocks ---")
+        latest = df.iloc[-1]
+        print(f"Date: {latest['Date'].date()}")
+        total_cols = [c for c in df.columns if c.endswith("-TOTAL")]
+        for col in sorted(total_cols):
+            val = latest.get(col)
+            try:
+                if pd.notna(val) and float(val) > 0:
+                    print(f"  {col}: {int(float(val)):,}")
+            except (TypeError, ValueError):
+                pass
