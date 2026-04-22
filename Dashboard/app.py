@@ -1113,7 +1113,7 @@ with lcc_tab:
             with lr:
                 st.markdown("### PORT SHARE (%)")
                 lcc_port_vals = {p: safe_num(lcc_df.iloc[-1].get(f"LCC-{p}-TOTAL", 0)) for p in LCC_PORTS}
-                lcc_port_vals = {k: v for k, v in lcc_port_vals.items() if v > 0}
+                lcc_port_vals = {k: v for k, v in lcc_port_vals.items() if pd.notna(v) and v > 0}
                 fig_lcc_pie = go.Figure(data=[go.Pie(labels=[LCC_PORT_NAMES[p] for p in lcc_port_vals],
                                                       values=list(lcc_port_vals.values()), hole=0.6)])
                 fig_lcc_pie.update_layout(height=280, margin=dict(l=20, r=20, t=30, b=20))
