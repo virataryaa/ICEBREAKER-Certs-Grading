@@ -171,7 +171,8 @@ def certs_table_section(df, total_col, port_map, key_prefix):
     table_df["Date"] = table_df["Date"].dt.strftime("%d-%b-%y")
 
     change_df = df[["Date", total_col, *port_map.keys()]].sort_values("Date", ascending=False).copy()
-    change_df[[total_col, *port_map.keys()]] = change_df[[total_col, *port_map.keys()]].diff(-1)
+    _num_cols = [total_col, *port_map.keys()]
+    change_df[_num_cols] = change_df[_num_cols].apply(pd.to_numeric, errors="coerce").diff(-1)
     change_df = change_df.rename(columns={"Date": "Date", total_col: "TOTAL", **port_map})
     change_df["Date"] = change_df["Date"].dt.strftime("%d-%b-%y")
     chg_value_cols = [c for c in change_df.columns if c != "Date"]
