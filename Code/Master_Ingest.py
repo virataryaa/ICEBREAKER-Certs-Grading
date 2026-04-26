@@ -45,9 +45,16 @@ def send_email(subject: str, body_html: str):
         mail.Subject = subject
         mail.HTMLBody = body_html
         mail.Send()
+        outlook.GetNamespace("MAPI").SendAndReceive(False)
         log("Email sent.")
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Email sent.\n")
     except Exception as exc:
-        log(f"Email failed (Outlook may be closed): {exc}")
+        import traceback
+        msg = f"Email FAILED: {exc}\n{traceback.format_exc()}"
+        log(msg)
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(msg + "\n")
 
 
 def build_html_email(run_date: str, results: list, log_lines: list) -> str:
