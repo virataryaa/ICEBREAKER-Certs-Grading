@@ -135,6 +135,9 @@ def build_rc():
         return existing
 
     out_file = OUT / "cert_lrc.parquet"
+    df = df.replace('', pd.NA)
+    for col in df.select_dtypes(include='object').columns:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
     df.to_parquet(out_file, index=False)
     print(f"[RC] Saved: {out_file}")
     print(f"     Rows: {len(df)} | Date range: {df['Date'].min().date()} to {df['Date'].max().date()}")

@@ -55,11 +55,18 @@ def build_html_email(run_date: str, results: list, log_lines: list) -> str:
     for r in results:
         status_color = "#1b5e20" if r["status"] == "OK" else "#b71c1c"
         status_bg = "#e8f5e9" if r["status"] == "OK" else "#ffebee"
+        today_val = r.get("today_rows")
+        today_cell = (
+            f'<span style="font-weight:700;color:#0d47a1">{today_val:,} new</span>'
+            if today_val
+            else '<span style="color:#aaa">0</span>'
+        ) if today_val is not None else "—"
         rows_html += f"""
         <tr>
             <td style="padding:6px 12px;border-bottom:1px solid #eee;font-weight:600">{r['script']}</td>
             <td style="padding:6px 12px;border-bottom:1px solid #eee;text-align:center;
                        background:{status_bg};color:{status_color};font-weight:700">{r['status']}</td>
+            <td style="padding:6px 12px;border-bottom:1px solid #eee;text-align:center">{today_cell}</td>
             <td style="padding:6px 12px;border-bottom:1px solid #eee;text-align:right">{r.get('rows','—')}</td>
             <td style="padding:6px 12px;border-bottom:1px solid #eee">{r.get('date_range','—')}</td>
             <td style="padding:6px 12px;border-bottom:1px solid #eee;color:#888;font-size:0.85em">{r.get('error','')}</td>
@@ -81,7 +88,8 @@ def build_html_email(run_date: str, results: list, log_lines: list) -> str:
             <tr style="background:#1f2a44;color:white">
                 <th style="padding:8px 12px;text-align:left">Script</th>
                 <th style="padding:8px 12px">Status</th>
-                <th style="padding:8px 12px;text-align:right">Rows</th>
+                <th style="padding:8px 12px">Today</th>
+                <th style="padding:8px 12px;text-align:right">Total Rows</th>
                 <th style="padding:8px 12px;text-align:left">Date Range</th>
                 <th style="padding:8px 12px;text-align:left">Error</th>
             </tr>
@@ -101,7 +109,7 @@ def build_html_email(run_date: str, results: list, log_lines: list) -> str:
 # ── Run one script ─────────────────────────────────────────────────────────────
 def run_script(module_name: str, func_name: str, label: str) -> dict:
     log(f"--- {label} ---")
-    result = {"script": label, "status": "FAIL", "rows": None, "date_range": None, "error": ""}
+    result = {"script": label, "status": "FAIL", "rows": None, "date_range": None, "today_rows": None, "error": ""}
     try:
         import importlib
         mod = importlib.import_module(module_name)
@@ -109,14 +117,16 @@ def run_script(module_name: str, func_name: str, label: str) -> dict:
         df = getattr(mod, func_name)()
         if df is not None and hasattr(df, "__len__"):
             result["rows"] = f"{len(df):,}"
-            if "Date" in df.columns:
-                result["date_range"] = f"{df['Date'].min().date()} → {df['Date'].max().date()}"
-            elif "PanelDate" in df.columns:
-                result["date_range"] = f"{df['PanelDate'].min().date()} → {df['PanelDate'].max().date()}"
-            elif "PublishedDate" in df.columns:
-                result["date_range"] = f"{df['PublishedDate'].min().date()} → {df['PublishedDate'].max().date()}"
+            today = datetime.date.today()
+            for col in ("Date", "PanelDate", "PublishedDate"):
+                if col in df.columns:
+                    col_dates = df[col].dt.date if hasattr(df[col], "dt") else df[col]
+                    result["date_range"] = f"{col_dates.min()} -> {col_dates.max()}"
+                    result["today_rows"] = int((col_dates == today).sum())
+                    break
         result["status"] = "OK"
-        log(f"    OK — {result['rows']} rows | {result['date_range']}")
+        today_str = f" | today={result['today_rows']} new" if result["today_rows"] is not None else ""
+        log(f"    OK -- {result['rows']} rows | {result['date_range']}{today_str}")
     except Exception:
         err = traceback.format_exc()
         result["error"] = err.splitlines()[-1][:120]
